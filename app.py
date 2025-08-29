@@ -2,7 +2,7 @@
 import os
 import streamlit as st
 from narrator import humanize
-from core_strategy import analyze_ticker
+from core_strategy import analyze_ticker, Decision
 from backtest import run_backtest
 
 st.set_page_config(page_title="CapinteL-Q — Анализ рынков (Polygon)", layout="centered")
