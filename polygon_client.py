@@ -1,55 +1,43 @@
-# polygon_client.py
-import os
-import requests
+import os, requests, datetime as dt
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY","").strip()
+API = os.getenv("POLYGON_API_KEY","").strip()
+BASE = "https://api.polygon.io"
 
-# Helper: convert Polygon's aggregate bars to DataFrame
-def _bars_to_df(bars):
-    if not bars:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-    rows = []
-    for b in bars:
-        rows.append({
-            "timestamp": pd.to_datetime(b["t"], unit="ms", utc=True).tz_convert("UTC"),
-            "open": float(b["o"]), "high": float(b["h"]), "low": float(b["l"]),
-            "close": float(b["c"]), "volume": float(b.get("v",0))
-        })
-    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-    return df
+def _check_key():
+    if not API:
+        raise RuntimeError("POLYGON_API_KEY не найден в окружении.")
 
-def fetch_daily(ticker:str, days:int=365*3, adjusted:bool=True) -> pd.DataFrame:
-    """
-    Download ~N days of daily bars for ticker from Polygon.io aggregates v2 endpoint.
-    Returns UTC-indexed DataFrame with columns: open, high, low, close, volume.
-    """
-    if not POLYGON_API_KEY:
-        raise RuntimeError("POLYGON_API_KEY отсутствует в окружении")
-    ticker = ticker.upper().strip()
-    # Crypto support (like X:BTCUSD)
-    is_crypto = ":" in ticker
-    mult = 1
-    timespan = "day"
-    base_url = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{mult}/{timespan}/{from_}/{to_}"
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days+5)
-    url = base_url.format(ticker=ticker, mult=mult, timespan=timespan, from_=start.isoformat(), to_=end.isoformat())
-    params = {"adjusted": "true" if adjusted else "false", "sort": "asc", "apiKey": POLYGON_API_KEY, "limit":50000}
-    r = requests.get(url, params=params, timeout=30)
+def _get(url, params=None):
+    _check_key()
+    p = {"apiKey": API}
+    if params:
+        p.update(params)
+    r = requests.get(url, params=p, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    results = data.get("results", [])
-    df = _bars_to_df(results)
-    if df.empty:
-        raise RuntimeError(f"Polygon вернул пусто для {ticker}")
-    df = df.set_index("timestamp")
-    return df
+    return r.json()
 
-def fetch_last_price(ticker:str) -> float:
+def fetch_daily(ticker:str, start:str, end:str)->pd.DataFrame:
     """
-    Last close (from daily) as a robust 'current' price proxy.
+    Daily aggs (1d) [adj]
+    start/end: 'YYYY-MM-DD'
     """
-    df = fetch_daily(ticker, days=10)
-    return float(df["close"].iloc[-1])
+    url = f"{BASE}/v2/aggs/ticker/{ticker.upper()}/range/1/day/{start}/{end}"
+    js = _get(url, {"adjusted":"true","sort":"asc","limit":50000})
+    rows = js.get("results",[]) or []
+    if not rows: 
+        return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    df = pd.DataFrame(rows)
+    df["date"]  = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
+    return df[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
+
+def latest_price(ticker:str)->float:
+    """Берём последнюю дневную close; если есть ‘last trade’ — можно заменить."""
+    today = dt.date.today()
+    start = (today - dt.timedelta(days=400)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
+    df = fetch_daily(ticker, start, end)
+    if df.empty: 
+        raise RuntimeError("Не удалось получить котировки.")
+    return float(df.iloc[-1]["close"]), df
