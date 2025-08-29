@@ -1,29 +1,30 @@
-# narrator.py
-from typing import Optional, Tuple
-from core_strategy import Decision
+from dataclasses import dataclass
 
-def humanize(dec: Decision, ticker: str) -> str:
-    """Human-style memo without revealing internal math (no raw pivots in text)."""
-    hru = {"short":"Трейд (1–5 дней)","mid":"Среднесрок (1–4 недели)","long":"Долгосрок (1–6 месяцев)"}[dec.horizon]
-    header = f"📌 {ticker.upper()} — {hru}\n💵 Текущая цена: {dec.price:.2f}\n"
-    if dec.stance == "BUY":
-        body = "📈 База: BUY — работаем от спроса.\n"
-    elif dec.stance == "SELL":
-        body = "📉 База: SELL — работаем от предложения.\n"
+@dataclass
+class Decision:
+    stance: str        # 'LONG' / 'SHORT' / 'WAIT'
+    entry: tuple|float|None
+    target1: float|None
+    target2: float|None
+    stop: float|None
+    comment: str
+    meta: dict
+
+def humanize(dec: Decision) -> str:
+    if dec.stance == "WAIT":
+        return f"🧠 Сейчас выгоднее подождать. {dec.comment}"
+    side = "ЛОНГ" if dec.stance=="LONG" else "ШОРТ"
+    if isinstance(dec.entry, tuple):
+        e = f"{dec.entry[0]:.2f}…{dec.entry[1]:.2f}"
+    elif dec.entry is None:
+        e = "—"
     else:
-        body = "⏸ База: WAIT — вход на текущих не даёт преимущества.\n"
-    parts = [header, body]
-
-    if dec.entry:
-        parts.append(f"🎯 Зона входа: {dec.entry[0]:.2f}…{dec.entry[1]:.2f}\n")
-    if dec.target1:
-        parts.append(f"🎯 Цель 1: {dec.target1:.2f}\n")
-    if dec.target2:
-        parts.append(f"🎯 Цель 2: {dec.target2:.2f}\n")
-    if dec.stop:
-        parts.append(f"🛡️ Стоп/защита: {dec.stop:.2f}\n")
-
-    if dec.notes:
-        parts.append(f"🧭 Комментарий: {dec.notes}")
-
-    return "".join(parts)
+        e = f"{float(dec.entry):.2f}"
+    t1 = f"{dec.target1:.2f}" if dec.target1 else "—"
+    t2 = f"{dec.target2:.2f}" if dec.target2 else "—"
+    st = f"{dec.stop:.2f}" if dec.stop else "—"
+    return (
+        f"🧭 Сценарий: {side}\n"
+        f"🎯 Вход: {e} | Цели: {t1} / {t2} | Защита: {st}\n"
+        f"💬 Комментарий: {dec.comment}"
+    )
