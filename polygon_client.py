@@ -1,3 +1,4 @@
+# polygon_client.py
 import os, requests, datetime as dt
 import pandas as pd
 
@@ -17,27 +18,38 @@ def _get(url, params=None):
     r.raise_for_status()
     return r.json()
 
-def fetch_daily(ticker:str, start:str, end:str)->pd.DataFrame:
+def fetch_daily(ticker: str, start: str | None = None, end: str | None = None, **kwargs) -> pd.DataFrame:
     """
-    Daily aggs (1d) [adj]
-    start/end: 'YYYY-MM-DD'
+    Гибкая обёртка Polygon /v2/aggs:
+      - fetch_daily('QQQ', start='2022-01-01', end='2025-01-01')
+      - fetch_daily('QQQ', days=400)   # альтернативный вариант
     """
+    # поддержка старого вызова: days=...
+    days = kwargs.pop("days", None)
+    if days is not None:
+        end_d = dt.date.today()
+        start_d = end_d - dt.timedelta(days=int(days))
+        start, end = start_d.isoformat(), end_d.isoformat()
+
+    if not start or not end:
+        # безопасный дефолт: 400 дней
+        end_d = dt.date.today()
+        start_d = end_d - dt.timedelta(days=400)
+        start, end = start_d.isoformat(), end_d.isoformat()
+
     url = f"{BASE}/v2/aggs/ticker/{ticker.upper()}/range/1/day/{start}/{end}"
-    js = _get(url, {"adjusted":"true","sort":"asc","limit":50000})
-    rows = js.get("results",[]) or []
-    if not rows: 
-        return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    js = _get(url, {"adjusted": "true", "sort": "asc", "limit": 50000})
+    rows = js.get("results", []) or []
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
     df = pd.DataFrame(rows)
-    df["date"]  = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    df["date"] = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
     df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
     return df[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
 
-def latest_price(ticker:str)->float:
-    """Берём последнюю дневную close; если есть ‘last trade’ — можно заменить."""
-    today = dt.date.today()
-    start = (today - dt.timedelta(days=400)).strftime("%Y-%m-%d")
-    end   = today.strftime("%Y-%m-%d")
-    df = fetch_daily(ticker, start, end)
-    if df.empty: 
+def latest_price(ticker: str) -> tuple[float, pd.DataFrame]:
+    """Последняя close и весь датасет (примерно за 400 дней)."""
+    df = fetch_daily(ticker, days=400)
+    if df.empty:
         raise RuntimeError("Не удалось получить котировки.")
     return float(df.iloc[-1]["close"]), df
