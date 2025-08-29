@@ -1,6 +1,6 @@
-# app.py
-import os
+# app.py (верх файла)
 import streamlit as st
+from core_strategy import analyze_ticker, run_backtest, Decision, Stance
 from narrator import humanize
 from core_strategy import analyze_ticker
 from backtest import run_backtest
@@ -40,9 +40,21 @@ with st.expander("📊 Бэктест (экспериментально)"):
     if st.button("Запустить бэктест"):
         with st.spinner("Считаю…"):
             res = run_backtest(ticker, horizon=horizon, years=y, start_capital=start_cap, fee_bp=fee_bp)
-        if "error" in res.get("summary", {}):
-            st.warning(res["summary"]["error"])
-        else:
-            st.markdown("#### Результаты:")
-            st.json(res["summary"])
-            st.dataframe(res["trades"], use_container_width=True)
+        if "error" in res: Decision = analyze_ticker(ticker, horizon=horizon_key)
+
+st.subheader(f"{res.ticker} — текущая цена: ${res.price:,.2f}")
+
+st.markdown("### 🧠 Результат:")
+st.write(
+    "🧠 " + (
+        "Сейчас выгоднее подождать." if res.stance == Stance.WAIT else
+        ("Покупка." if res.stance == Stance.BUY else
+         ("Шорт." if res.stance == Stance.SHORT else "Фиксация.")))
+)
+
+# Короткий человеческий текст
+st.write(res.comment)
+
+# Если нужно — показать уровни/диагностику только внутри раскрывашки
+with st.expander("Диагностика (уровни и мета)"):
+    st.json(res.meta)
