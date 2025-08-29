@@ -1,60 +1,156 @@
-# app.py (верх файла)
+# app.py
+# Streamlit UI для Capintel-Q (Polygon). Совместим с Python 3.11–3.12.
+# Предполагается, что core_strategy.py экспортирует:
+#   from narrator import Decision, Stance
+#   def analyze_ticker(ticker: str, horizon: str) -> Decision
+
+import os
+import traceback
 import streamlit as st
-from core_strategy import analyze_ticker, run_backtest, Decision, Stance
-from narrator import humanize
-from core_strategy import analyze_ticker
-from backtest import run_backtest
 
-st.set_page_config(page_title="CapinteL-Q — Анализ рынков (Polygon)", layout="centered")
+from core_strategy import analyze_ticker  # возвращает Decision-объект
 
-st.title("CapinteL-Q — Анализ рынков (Polygon)")
-st.caption("Источник данных: Polygon.io • В тексте — только действия (вход/цели/стоп/альтернатива). "
-           "Внутренние правила и расчёты скрыты.")
+# -----------------------------
+# Настройки страницы и UI
+# -----------------------------
+st.set_page_config(
+    page_title="Capintel-Q — Анализ рынков (Polygon)",
+    page_icon="📊",
+    layout="centered",
+)
 
-ticker = st.text_input("Тикер (например, QQQ, AAPL, X:BTCUSD)", "QQQ").upper().strip()
+st.markdown(
+    "<h1 style='margin-bottom:0'>CapintelL-Q — Анализ рынков (Polygon)</h1>"
+    "<div style='opacity:.7'>Источник данных: Polygon.io · В тексте — только действия (вход/цели/стоп/альтернатива). "
+    "Внутренние правила и расчёты скрыты.</div>",
+    unsafe_allow_html=True,
+)
 
-h_map = {
+# Проверим ключ Polygon (не обязателен для запуска UI, но предупредим)
+if not os.getenv("POLYGON_API_KEY"):
+    st.warning(
+        "Не найден POLYGON_API_KEY в окружении. Данные могут не загрузиться. "
+        "Добавь секрет в Streamlit → Settings → Secrets."
+    )
+
+# -----------------------------
+# Ввод пользователя
+# -----------------------------
+ticker = st.text_input(
+    "Тикер (например, QQQ, AAPL, X:BTCUSD)",
+    value="QQQ",
+).strip().upper()
+
+horizon_label = st.selectbox(
+    "Горизонт:",
+    ["Трейд (1–5 дней)", "Среднесрок (1–4 недели)", "Долгосрок (1–6 месяцев)"],
+    index=1,
+)
+
+HMAP = {
     "Трейд (1–5 дней)": "short",
     "Среднесрок (1–4 недели)": "mid",
     "Долгосрок (1–6 месяцев)": "long",
 }
-h_label = st.selectbox("Горизонт:", list(h_map.keys()), index=1)
-horizon = h_map[h_label]
+horizon = HMAP[horizon_label]
 
-colA, _ = st.columns([1,1])
-with colA:
-    if st.button("Проанализировать", use_container_width=True):
+run = st.button("Проанализировать", type="primary")
+
+# -----------------------------
+# Отрисовка результата
+# -----------------------------
+def render_decision(res):
+    """Красиво вывести Decision-объект без раскрытия внутренней математики."""
+    # Заголовок с текущей ценой
+    st.subheader(f"{res.ticker} — текущая цена: ${res.price:,.2f}")
+
+    # Основной блок: сценарий и текст-комментарий
+    st.markdown("### 🧠 Результат:")
+    # Комментарий уже 'human-style' из стратегии
+    st.write(res.comment)
+
+    # Лента действий (если что-то отсутствует — не показываем)
+    info_lines = []
+    if res.entry and isinstance(res.entry, (tuple, list)) and len(res.entry) == 2:
+        info_lines.append(f"🎯 **Вход:** {res.entry[0]:.2f} … {res.entry[1]:.2f}")
+    if res.target1:
+        info_lines.append(f"🎯 **Цель 1:** {res.target1:.2f}")
+    if res.target2:
+        info_lines.append(f"🎯 **Цель 2:** {res.target2:.2f}")
+    if res.stop:
+        info_lines.append(f"🛡️ **Стоп/защита:** {res.stop:.2f}")
+    if info_lines:
+        st.markdown("\n\n".join(info_lines))
+
+    # Диагностика — опционально (мета-данные/уровни), скрыто по умолчанию
+    with st.expander("🔧 Диагностика (уровни и мета)"):
+        # res.meta — это словарь с любыми тех. полями (не показываем по умолчанию)
         try:
-            dec = analyze_ticker(ticker, horizon=horizon)
-            txt = humanize(ticker, dec)   # <- без индикаторов
-            st.subheader(f"{ticker} — текущая цена: {dec.get('meta',{}).get('price','—')}")
-            st.markdown("### 🧠 Результат:")
-            st.write(txt)
+            st.json(res.meta)
+        except Exception:
+            st.write(res.meta)
+
+if run:
+    if not ticker:
+        st.error("Укажи тикер.")
+    else:
+        try:
+            res = analyze_ticker(ticker, horizon=horizon)  # <-- ВОЗВРАЩАЕТ Decision
+            # Ожидаемые поля:
+            #   res.ticker : str
+            #   res.price  : float
+            #   res.stance : Enum или str (но мы не используем .get)
+            #   res.entry  : tuple[low, high] | None
+            #   res.target1, res.target2, res.stop : float | None
+            #   res.comment : str (человеческий текст)
+            #   res.meta    : dict (диагностика)
+            render_decision(res)
+
         except Exception as e:
             st.error(f"Ошибка: {e}")
+            with st.expander("Стек ошибки"):
+                st.code("".join(traceback.format_exc()))
 
-with st.expander("📊 Бэктест (экспериментально)"):
-    y = st.slider("Период, лет:", 1, 5, 3)
-    start_cap = st.number_input("Стартовый капитал, $", 1_000.0, 10_000_000.0, 100_000.0, step=1_000.0)
-    fee_bp = st.number_input("Комиссия, б.п. (в обе стороны)", 0.0, 50.0, 5.0, step=0.5)
+# -----------------------------
+# (необязательный) блок бэктеста — заглушка
+# -----------------------------
+st.markdown("---")
+st.caption("📈 Бэктест (экспериментально) — будет работать только если в проекте есть run_backtest().")
+
+try:
+    from core_strategy import run_backtest  # опционально
+
+    years = st.slider("Период, лет:", 1, 5, 3)
+    start_capital = st.number_input("Стартовый капитал, $", value=100000.0, min_value=1000.0, step=1000.0, format="%.2f")
+    fee_bps = st.number_input("Комиссия, б.п. (в обе стороны)", value=5.0, min_value=0.0, step=0.5, format="%.2f")
+
     if st.button("Запустить бэктест"):
-        with st.spinner("Считаю…"):
-            res = run_backtest(ticker, horizon=horizon, years=y, start_capital=start_cap, fee_bp=fee_bp)
-        if "error" in res: Decision = analyze_ticker(ticker, horizon=horizon_key)
-
-st.subheader(f"{res.ticker} — текущая цена: ${res.price:,.2f}")
-
-st.markdown("### 🧠 Результат:")
-st.write(
-    "🧠 " + (
-        "Сейчас выгоднее подождать." if res.stance == Stance.WAIT else
-        ("Покупка." if res.stance == Stance.BUY else
-         ("Шорт." if res.stance == Stance.SHORT else "Фиксация.")))
-)
-
-# Короткий человеческий текст
-st.write(res.comment)
-
-# Если нужно — показать уровни/диагностику только внутри раскрывашки
-with st.expander("Диагностика (уровни и мета)"):
-    st.json(res.meta)
+        try:
+            bt = run_backtest(
+                ticker=ticker or "QQQ",
+                horizon=horizon,
+                years=years,
+                start_capital=start_capital,
+                fee_bps=fee_bps,
+            )
+            # Ожидаем, что bt — dict с полями summary/curve/trades и т.п.
+            st.success("Бэктест завершён.")
+            if isinstance(bt, dict):
+                if "summary" in bt:
+                    st.subheader("Итоги")
+                    st.json(bt["summary"])
+                if "trades" in bt:
+                    st.subheader("Сделки")
+                    st.dataframe(bt["trades"])
+                if "equity" in bt:
+                    st.subheader("Equity (синтетика)")
+                    st.line_chart(bt["equity"])
+            else:
+                st.write(bt)
+        except Exception as e:
+            st.error(f"Ошибка бэктеста: {e}")
+            with st.expander("Стек ошибки (бэктест)"):
+                st.code("".join(traceback.format_exc()))
+except Exception:
+    # Если run_backtest отсутствует — просто ничего не делаем
+    pass
