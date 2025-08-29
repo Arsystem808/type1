@@ -1,361 +1,439 @@
 # core_strategy.py
-# CapinteL-Q – ядро сигналов (Polygon-only, без утечек формул в текст)
-# Python 3.11+
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import os
 import math
 import time
+import json
 import datetime as dt
-from dataclasses import dataclass, asdict, field
-from typing import Optional, Tuple, Dict, Any, Literal
+from dataclasses import dataclass, asdict
+from typing import Optional, Tuple, Dict, Any, List, Literal
+
 import requests
 
-# --------------------------- Константы/среда ---------------------------
+
+# =========================
+# Конфиг и утилиты времени
+# =========================
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-POLYGON_BASE = "https://api.polygon.io"
 
-# для крипто тикеров принято префиксовать "X:" (например, X:BTCUSD)
-# для акций/ETF — как есть: QQQ, AAPL и т.п.
+Horizon = Literal["short", "mid", "long"]  # 1–5д, 1–4н, 1–6м
 
-# --------------------------- Утилиты данных ---------------------------
+def _utc_today() -> dt.date:
+    return dt.datetime.utcnow().date()
 
-def _poly_agg_day(ticker: str, start: str, end: str, adjusted: bool = True, limit: int = 5000):
-    """Сырые дневные свечи Polygon aggregates v2."""
-    url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+def _date_of_ms(ms: int) -> dt.date:
+    return dt.datetime.utcfromtimestamp(ms / 1000).date()
+
+def _start_of_iso_week(d: dt.date) -> dt.date:
+    return d - dt.timedelta(days=d.weekday())
+
+def _start_of_month(d: dt.date) -> dt.date:
+    return d.replace(day=1)
+
+def _start_of_year(d: dt.date) -> dt.date:
+    return d.replace(month=1, day=1)
+
+def _prev_complete_week(today: dt.date) -> Tuple[dt.date, dt.date]:
+    start_cur = _start_of_iso_week(today)
+    end_prev = start_cur - dt.timedelta(days=1)
+    start_prev = end_prev - dt.timedelta(days=6)
+    return start_prev, end_prev
+
+def _prev_complete_month(today: dt.date) -> Tuple[dt.date, dt.date]:
+    first_cur = _start_of_month(today)
+    end_prev = first_cur - dt.timedelta(days=1)
+    first_prev = _start_of_month(end_prev)
+    return first_prev, end_prev
+
+def _prev_complete_year(today: dt.date) -> Tuple[dt.date, dt.date]:
+    first_cur = _start_of_year(today)
+    end_prev = first_cur - dt.timedelta(days=1)
+    first_prev = _start_of_year(end_prev)
+    return first_prev, end_prev
+
+
+# ================
+# Polygon загрузчик
+# ================
+
+class PolygonError(RuntimeError):
+    pass
+
+def _poly_agg_day(ticker: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
+    """
+    Днёвки по тикеру [start..end] включительно; sort=asc.
+    Возвращает список баров: {t(ms), o,h,l,c,v}
+    """
+    if not POLYGON_API_KEY:
+        raise PolygonError("POLYGON_API_KEY отсутствует в окружении")
+
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
     params = {
-        "adjusted": "true" if adjusted else "false",
-        "limit": limit,
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 50000,
         "apiKey": POLYGON_API_KEY,
     }
     r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    results = j.get("results", []) or []
+    if r.status_code == 429:
+        # грубый backoff на всякий
+        time.sleep(1.0)
+        r = requests.get(url, params=params, timeout=20)
+    if r.status_code >= 300:
+        raise PolygonError(f"Polygon {r.status_code}: {r.text[:240]}")
+    data = r.json()
+    results = data.get("results") or []
     out = []
     for x in results:
         out.append({
-            "ts": int(x["t"]) // 1000,
+            "t": x["t"],
             "o": float(x["o"]),
             "h": float(x["h"]),
             "l": float(x["l"]),
             "c": float(x["c"]),
-            "v": float(x.get("v", 0)),
+            "v": float(x.get("v", 0.0)),
         })
     return out
 
-def fetch_daily(ticker: str, lookback_days: int = 900) -> list[dict]:
-    """Дневные свечи за lookback_days (с запасом). Возвращает список dict в хронологическом порядке."""
-    if not POLYGON_API_KEY:
-        raise RuntimeError("POLYGON_API_KEY отсутствует в окружении")
-    end = dt.date.today()
-    start = end - dt.timedelta(days=lookback_days + 7)
-    data = _poly_agg_day(ticker, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-    # сортируем по времени на всякий
-    data.sort(key=lambda x: x["ts"])
-    return data
+def _poly_last_n_days(ticker: str, n: int) -> List[Dict[str, Any]]:
+    end = _utc_today()
+    start = end - dt.timedelta(days=max(n, 10))
+    return _poly_agg_day(ticker, start, end)
 
-def last_close(data: list[dict]) -> float:
-    return float(data[-1]["c"])
 
-# --------------------------- Индикаторные расчёты ---------------------------
+# ==================
+# Технич. расчёты
+# ==================
 
-def heikin_ashi(candles: list[dict]) -> list[dict]:
-    """Строим HA OHLC (по классике)."""
-    ha = []
-    ha_o = (candles[0]["o"] + candles[0]["c"]) / 2.0
-    ha_c = (candles[0]["o"] + candles[0]["h"] + candles[0]["l"] + candles[0]["c"]) / 4.0
-    ha.append({"o": ha_o, "h": candles[0]["h"], "l": candles[0]["l"], "c": ha_c})
-    for i in range(1, len(candles)):
-        o = candles[i]["o"]; h = candles[i]["h"]; l = candles[i]["l"]; c = candles[i]["c"]
-        ha_c = (o + h + l + c) / 4.0
-        ha_o = (ha[-1]["o"] + ha[-1]["c"]) / 2.0
-        ha_h = max(h, ha_o, ha_c)
-        ha_l = min(l, ha_o, ha_c)
-        ha.append({"o": ha_o, "h": ha_h, "l": ha_l, "c": ha_c})
-    return ha
+def heikin_ashi(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """Heikin Ashi из обычных OHLC."""
+    if not bars:
+        return []
+    out = []
+    ha_open = (bars[0]["o"] + bars[0]["c"]) / 2.0
+    ha_close = (bars[0]["o"] + bars[0]["h"] + bars[0]["l"] + bars[0]["c"]) / 4.0
+    ha_high = max(bars[0]["h"], ha_open, ha_close)
+    ha_low  = min(bars[0]["l"], ha_open, ha_close)
+    out.append({"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close})
+    for b in bars[1:]:
+        ha_close = (b["o"] + b["h"] + b["l"] + b["c"]) / 4.0
+        ha_open = (out[-1]["o"] + out[-1]["c"]) / 2.0
+        ha_high = max(b["h"], ha_open, ha_close)
+        ha_low  = min(b["l"], ha_open, ha_close)
+        out.append({"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close})
+    return out
 
-def macd_hist(closes: list[float], fast=12, slow=26, signal=9) -> list[float]:
-    def ema(vals, period):
-        k = 2 / (period + 1)
-        e = []
-        prev = sum(vals[:period]) / period
-        e.append(prev)
-        for v in vals[period:]:
-            prev = v * k + prev * (1 - k)
-            e.append(prev)
-        # выравниваем длину (сдвиг) – добавим хвост None в начале
-        pad = [None] * (len(vals) - len(e))
-        return pad + e
-    if len(closes) < slow + signal + 5:
-        return [0.0]*len(closes)
-    ema_fast = ema(closes, fast)
-    ema_slow = ema(closes, slow)
-    macd = [ (a - b) if (a is not None and b is not None) else None
-             for a,b in zip(ema_fast, ema_slow)]
-    # уберём None в начале
-    macd_clean = [x for x in macd if x is not None]
-    sig = ema(macd_clean, signal)
-    sig_full = [None]*(len(macd) - len(sig)) + sig
+def _ema(values: List[float], period: int) -> List[Optional[float]]:
+    if not values or period <= 0:
+        return [None]*len(values)
+    k = 2 / (period + 1)
+    out: List[Optional[float]] = []
+    ema_val: Optional[float] = None
+    for v in values:
+        if ema_val is None:
+            ema_val = v
+        else:
+            ema_val = (v - ema_val) * k + ema_val
+        out.append(ema_val)
+    return out
+
+def macd_hist(closes: List[float]) -> List[Optional[float]]:
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd = [ (a - b) if (a is not None and b is not None) else None for a,b in zip(ema12, ema26) ]
+    sig9 = _ema([0.0 if v is None else v for v in macd], 9)
     hist = []
-    for m, s in zip(macd, sig_full):
-        hist.append(0.0 if (m is None or s is None) else (m - s))
+    for m, s in zip(macd, sig9):
+        if m is None or s is None:
+            hist.append(None)
+        else:
+            hist.append(m - s)
     return hist
 
-def rsi_wilder(closes: list[float], period: int = 14) -> list[float]:
-    if len(closes) < period + 2:
-        return [50.0]*len(closes)
-    gains = [0.0]; losses = [0.0]
+def rsi_wilder(closes: List[float], period: int = 14) -> List[Optional[float]]:
+    if len(closes) < period + 1:
+        return [None]*len(closes)
+    gains, losses = [], []
     for i in range(1, len(closes)):
         ch = closes[i] - closes[i-1]
         gains.append(max(ch, 0.0))
         losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains[1:period+1]) / period
-    avg_loss = sum(losses[1:period+1]) / period
-    rsis = [50.0]*period
-    for i in range(period+1, len(closes)):
+    # начальная средняя
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out = [None]*(period)  # до первого значения
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
+    out.append(100 - 100/(1+rs))
+    for i in range(period, len(gains)):
         avg_gain = (avg_gain*(period-1) + gains[i]) / period
         avg_loss = (avg_loss*(period-1) + losses[i]) / period
-        rs = float('inf') if avg_loss == 0 else (avg_gain/avg_loss)
-        rsi = 100 - (100 / (1 + rs))
-        rsis.append(rsi)
-    # выравниваем
-    rsis = [50.0]*(len(closes)-len(rsis)) + rsis
-    return rsis
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
+        out.append(100 - 100/(1+rs))
+    return out if len(out) == len(closes) else out + [None]*(len(closes)-len(out))
 
-def atr_wilder(candles: list[dict], period: int = 14) -> list[float]:
-    if len(candles) < period + 2:
-        return [0.0]*len(candles)
-    trs = [0.0]
-    for i in range(1, len(candles)):
-        h = candles[i]["h"]; l = candles[i]["l"]; pc = candles[i-1]["c"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    atrs = []
-    atr = sum(trs[1:period+1]) / period
-    atrs = [0.0]*period + [atr]
-    for i in range(period+1, len(trs)):
-        atr = (atr*(period-1) + trs[i]) / period
-        atrs.append(atr)
-    atrs = [0.0]*(len(candles)-len(atrs)) + atrs
-    return atrs
+def atr_wilder(bars: List[Dict[str,float]], period: int=14) -> List[Optional[float]]:
+    if len(bars) < period+1:
+        return [None]*len(bars)
+    trs = []
+    for i, b in enumerate(bars):
+        if i == 0:
+            trs.append(b["h"] - b["l"])
+        else:
+            prev_c = bars[i-1]["c"]
+            tr = max(b["h"]-b["l"], abs(b["h"]-prev_c), abs(b["l"]-prev_c))
+            trs.append(tr)
+    # Wilder smoothing
+    atr = [None]*len(bars)
+    atr[period] = sum(trs[:period+1]) / (period+1)
+    for i in range(period+1, len(bars)):
+        atr[i] = (atr[i-1]*(period) + trs[i]) / (period+1)
+    return atr
 
-# --------------------------- Пивоты (Fibonacci) ---------------------------
 
-def _pivot_fib(h: float, l: float, c: float) -> Dict[str, float]:
-    P = (h + l + c) / 3.0
-    R1 = P + 0.382*(h - l); S1 = P - 0.382*(h - l)
-    R2 = P + 0.618*(h - l); S2 = P - 0.618*(h - l)
-    R3 = P + 1.000*(h - l); S3 = P - 1.000*(h - l)
-    return {"P":P,"R1":R1,"R2":R2,"R3":R3,"S1":S1,"S2":S2,"S3":S3}
+# ============================
+# Пивоты (Fibonacci) прошл. ТФ
+# ============================
 
-def _period_bounds(ts: int, period: Literal["W","M","Y"]) -> Tuple[int,int]:
-    d = dt.datetime.utcfromtimestamp(ts).date()
-    if period == "W":
-        # берем ПРЕДЫДУЩУЮ неделю (пн-вс)
-        wd = d.weekday()
-        # конец прошлой недели = понедельник текущей 00:00
-        end = dt.datetime.combine(d - dt.timedelta(days=wd), dt.time())
-        start = end - dt.timedelta(days=7)
-    elif period == "M":
-        first = dt.datetime(d.year, d.month, 1)
-        end = first
-        prev_month_last_day = first - dt.timedelta(days=1)
-        start = dt.datetime(prev_month_last_day.year, prev_month_last_day.month, 1)
-    else:  # "Y"
-        end = dt.datetime(d.year, 1, 1)
-        start = dt.datetime(d.year-1, 1, 1)
-    return (int(start.timestamp()), int(end.timestamp()))
+def _pivots_fib(H: float, L: float, C: float) -> Dict[str, float]:
+    P = (H + L + C) / 3.0
+    rng = H - L
+    R1 = P + 0.382 * rng
+    R2 = P + 0.618 * rng
+    R3 = P + 1.000 * rng
+    S1 = P - 0.382 * rng
+    S2 = P - 0.618 * rng
+    S3 = P - 1.000 * rng
+    return {"P": P, "R1": R1, "R2": R2, "R3": R3, "S1": S1, "S2": S2, "S3": S3}
 
-def pivots_from_previous_period(candles: list[dict], period: Literal["W","M","Y"]) -> Dict[str,float]:
-    if not candles:
-        return {"P":0,"R1":0,"R2":0,"R3":0,"S1":0,"S2":0,"S3":0}
-    # берём границы пред. периода относительно последней свечи
-    ts_last = candles[-1]["ts"]
-    start, end = _period_bounds(ts_last, period)
-    # фильтруем свечи в [start, end)
-    block = [x for x in candles if start <= x["ts"] < end]
-    if not block:
-        # подстрахуемся: если пусто, расширим окно ещё на 7 дней назад
-        start -= 7*24*3600
-        block = [x for x in candles if start <= x["ts"] < end]
-    h = max(x["h"] for x in block) if block else candles[-2]["h"]
-    l = min(x["l"] for x in block) if block else candles[-2]["l"]
-    c = block[-1]["c"] if block else candles[-2]["c"]
-    return _pivot_fib(h,l,c)
+def _period_slice_prev(bars: List[Dict[str,Any]], hz: Horizon) -> List[Dict[str,Any]]:
+    """Возвращает бары прошлой недели/месяца/года (завершённого периода)."""
+    if not bars:
+        return []
+    today = _utc_today()
+    if hz == "short":
+        a, b = _prev_complete_week(today)
+    elif hz == "mid":
+        a, b = _prev_complete_month(today)
+    else:
+        a, b = _prev_complete_year(today)
+    out = [x for x in bars if a <= _date_of_ms(x["t"]) <= b]
+    # запасной план, если рынок выходной/праздники → пусто
+    if not out:
+        lookback = {"short": 7, "mid": 35, "long": 400}[hz]
+        out = bars[-lookback-1:-1]
+    return out
 
-# --------------------------- «Интуитивные» фильтры ---------------------------
+def _pivots_for_horizon(bars: List[Dict[str,Any]], hz: Horizon) -> Dict[str, float]:
+    prev = _period_slice_prev(bars, hz)
+    H = max(x["h"] for x in prev)
+    L = min(x["l"] for x in prev)
+    C = prev[-1]["c"]
+    return _pivots_fib(H, L, C)
 
-def streak(values: list[float]) -> int:
-    """Длина последней однонаправленной серии для HA_close (>=0 – зелёная, <0 – красная) или MACD hist (>0/<0)."""
+
+# ============================
+# «Серии» (стрики) по знаку
+# ============================
+
+def _last_streak_by_sign(values: List[float]) -> int:
+    """Длина последней одноцветной серии (+/-). Возвращает signed length."""
     if not values:
         return 0
     last_sign = 1 if values[-1] >= 0 else -1
-    cnt = 0
+    n = 0
     for v in reversed(values):
-        if (v >= 0 and last_sign>0) or (v < 0 and last_sign<0):
-            cnt += 1
+        s = 1 if v >= 0 else -1
+        if s == last_sign:
+            n += 1
         else:
             break
-    return cnt * last_sign  # знак = цвет
+    return n * last_sign
 
-# --------------------------- Логика сигналов ---------------------------
+
+# ============================
+# Результат стратегии / вывод
+# ============================
 
 @dataclass
-class Output:
-    stance: str                                  # BUY / SHORT / WAIT
-    entry: Optional[Tuple[float,float]] = None   # (low, high) зоны
-    target1: Optional[float] = None
-    target2: Optional[float] = None
-    stop: Optional[float] = None
-    alt: Optional[str] = None
-    comment: Optional[str] = None
-    meta: Dict[str,Any] = field(default_factory=dict)
+class Decision:
+    stance: Literal["BUY","SHORT","WAIT"]
+    entry: Optional[Tuple[float, float]]  # диапазон входа или None
+    target1: Optional[float]
+    target2: Optional[float]
+    stop: Optional[float]
+    alt: Optional[str]
+    comment: str
+    meta: Dict[str, Any]
 
-    def to_dict(self) -> Dict[str,Any]:
-        return asdict(self)
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        return d
 
-def _tolerances(hz: Literal["short","mid","long"]) -> Tuple[float,float]:
-    if hz == "short":  # 1–5 дней
-        return (0.005, 0.008)
-    if hz == "mid":    # 1–4 недели
-        return (0.008, 0.010)
-    return (0.010, 0.012)  # long 1–6 мес
 
-def _horizon_to_period(hz: Literal["short","mid","long"]) -> Literal["W","M","Y"]:
-    return {"short":"W", "mid":"M", "long":"Y"}[hz]
-
-def _atr_mult(hz: Literal["short","mid","long"]) -> Tuple[float,float,float]:
-    # stop_mult, tgt1_mult, tgt2_mult (в ATR)
+def _tolerances(hz: Horizon) -> Tuple[float, float]:
+    # допуски к R2/R3 (и S2/S3) по горизонту
     if hz == "short":
-        return (0.8, 0.6, 1.1)
+        return 0.008, 0.012
     if hz == "mid":
-        return (1.0, 0.8, 1.6)  # цели всё же к опорам, множители – запас
-    return (1.3, 1.2, 2.0)
+        return 0.010, 0.016
+    return 0.012, 0.020
 
-def compose_decision(ticker: str, hz: Literal["short","mid","long"], candles: list[dict]) -> Output:
-    price = candles[-1]["c"]
-    closes = [x["c"] for x in candles]
-    ha = heikin_ashi(candles)
+
+def _human_comment_wait(hz: Horizon) -> str:
+    return {
+        "short": "Для трейда лучше не гнаться: ждём реакцию у края диапазона и подтверждение.",
+        "mid":   "Сейчас выгоднее подождать: нужен откат к опоре прошлого месяца или явный отказ.",
+        "long":  "Долгосрок — без суеты: ждём перезагрузку к годовым опорам и признаки разворота.",
+    }[hz]
+
+
+def _build_decision(bars: List[Dict[str,Any]], hz: Horizon) -> Decision:
+    # текущая цена
+    price = bars[-1]["c"]
+
+    # пивоты от прошлой недели/месяца/года
+    piv = _pivots_for_horizon(bars, hz)
+
+    # тех.метры (в meta, в текст не показываем)
+    ha = heikin_ashi(bars)
     ha_close = [x["c"] for x in ha]
+    ha_delta = [0.0] + [ha_close[i]-ha_close[i-1] for i in range(1, len(ha_close))]
+    ha_st = _last_streak_by_sign(ha_delta)
+
+    closes = [x["c"] for x in bars]
     macdh = macd_hist(closes)
-    rsi = rsi_wilder(closes)
-    atr = atr_wilder(candles)
+    macd_st = _last_streak_by_sign([0.0 if v is None else v for v in macdh])
 
-    period = _horizon_to_period(hz)
-    piv = pivots_from_previous_period(candles, period)
+    rsi = rsi_wilder(closes, 14)
+    atr = atr_wilder(bars, 14)
+    cur_atr = next((x for x in reversed(atr) if x is not None), None)
+
+    # зоны около R2/R3 & S2/S3
     tol_r2, tol_r3 = _tolerances(hz)
-    rng = piv["R2"] - piv["P"]
-    roof_r2_low  = piv["R2"] * (1 - tol_r2)
-    roof_r3_low  = piv["R3"] * (1 - tol_r3)
-    floor_s2_high = piv["S2"] * (1 + tol_r2)
-    floor_s3_high = piv["S3"] * (1 + tol_r3)
+    near_r2 = (piv["R2"] * (1 - tol_r2), piv["R2"] * (1 + tol_r2))
+    near_r3 = (piv["R3"] * (1 - tol_r3), piv["R3"] * (1 + tol_r3))
+    near_s2 = (piv["S2"] * (1 - tol_r2), piv["S2"] * (1 + tol_r2))
+    near_s3 = (piv["S3"] * (1 - tol_r3), piv["S3"] * (1 + tol_r3))
 
-    # стрики
-    ha_st = streak([1.0 if x>=ha_close[-1] else -1.0 for x in ha_close[-5:]])  # грубо, но нам нужна только длина знака последнего
-    macd_st = streak(macdh[-20:])
+    in_r2_zone = near_r2[0] <= price <= near_r2[1]
+    in_r3_zone = near_r3[0] <= price <= near_r3[1]
+    in_s2_zone = near_s2[0] <= price <= near_s2[1]
+    in_s3_zone = near_s3[0] <= price <= near_s3[1]
 
-    # Пороговые длины по ТЗ
     need_ha = {"short":4, "mid":5, "long":6}[hz]
     need_mh = {"short":4, "mid":6, "long":8}[hz]
 
-    # «Перегрев у крыши»
-    over_roof = (
-        (price >= roof_r2_low) and
-        (abs(ha_st) >= need_ha and ha_close[-1] >= ha_close[-2]) and
-        (abs(macd_st) >= need_mh and macdh[-1] > 0)
-    )
-    # «Перепроданность у дна»
-    under_floor = (
-        (price <= floor_s2_high) and
-        (abs(ha_st) >= need_ha and ha_close[-1] <= ha_close[-2]) and
-        (abs(macd_st) >= need_mh and macdh[-1] < 0)
-    )
-
-    stop_mult, t1_mult, t2_mult = _atr_mult(hz)
-    last_atr = max(atr[-1], 1e-8)
+    over_roof = (in_r3_zone or in_r2_zone) and (abs(ha_st) >= need_ha) and (abs(macd_st) >= need_mh) and (macdh[-1] is not None and macdh[-1] > 0)
+    under_floor = (in_s3_zone or in_s2_zone) and (abs(ha_st) >= need_ha) and (abs(macd_st) >= need_mh) and (macdh[-1] is not None and macdh[-1] < 0)
 
     meta = {
-        "price": round(price, 2),
-        "piv": {k: round(v, 2) for k,v in piv.items()},
-        "atr": round(last_atr, 3),
-        "hz": hz,
+        "price": price,
+        "piv": {k: round(v, 2) for k, v in piv.items()},
+        "rsi": rsi[-1],
+        "atr": cur_atr,
+        "ha_streak": ha_st,
+        "macd_streak": macd_st,
+        "horizon": hz,
     }
 
+    # SHORT у крыши
     if over_roof:
-        # База по ТЗ: WAIT, но разрешаем агрессивный SHORT (опционально)
-        # Дадим явный шорт с зоной "чуть выше/возле R2..R3", чтобы не шортить середину
-        zone_lo = max(piv["R2"] * (1 - 0.002), price)  # не ниже текущей
-        zone_hi = piv["R3"] * (1 + 0.003)
-        tgt1 = piv["R2"] if price >= piv["R3"] else max(piv["P"], piv["R1"] - 0.2*rng)
-        tgt2 = piv["P"] if price >= piv["R3"] else max(piv["S1"], piv["P"] - 0.5*rng)
-        stop = (piv["R3"] if price >= piv["R3"] else piv["R2"]) + max(0.5*last_atr, 0.003*price)
-        return Output(
+        if in_r3_zone:
+            entry = (min(price, near_r3[0]), near_r3[1])
+            t1, t2 = piv["R2"], piv["P"]
+            stop = piv["R3"] + (cur_atr or (piv["R3"] - piv["R2"]) * 0.4) * 0.8
+        else:  # у R2
+            entry = (near_r2[0], near_r2[1])
+            # консервативная первая цель ближе к P/S1, вторая глубже при силе
+            t1 = max(piv["P"] - 0.25*(piv["P"]-piv["S1"]), piv["S1"])
+            t2 = piv["S1"] if hz != "long" else piv["S2"]
+            stop = piv["R2"] + (cur_atr or (piv["R2"] - piv["R1"]) * 0.5) * 0.8
+
+        comment = "Перегруженный верх. Играем от ослабления, работаем аккуратно."
+        alt = None
+        return Decision(
             stance="SHORT",
-            entry=(round(zone_lo,2), round(zone_hi,2)),
-            target1=round(tgt1,2),
-            target2=round(tgt2,2),
+            entry=(round(entry[0],2), round(entry[1],2)),
+            target1=round(t1,2),
+            target2=round(t2,2),
             stop=round(stop,2),
-            alt="WAIT — ждём перезагрузку к P→S1",
-            comment="Перегрев у крыши; играем от ослабления.",
+            alt=alt,
+            comment=comment,
             meta=meta
         )
 
+    # LONG у дна
     if under_floor:
-        # Зеркально: LONG от дна
-        zone_lo = piv["S3"] * (1 - 0.003)
-        zone_hi = min(piv["S2"] * (1 + 0.002), price)  # не выше текущей
-        tgt1 = piv["S2"] if price <= piv["S3"] else min(piv["P"], piv["S1"] + 0.2*rng)
-        tgt2 = piv["P"] if price <= piv["S3"] else min(piv["R1"], piv["P"] + 0.5*rng)
-        stop = (piv["S3"] if price <= piv["S3"] else piv["S2"]) - max(0.5*last_atr, 0.003*price)
-        return Output(
+        if in_s3_zone:
+            entry = (near_s3[0], max(price, near_s3[1]))
+            t1, t2 = piv["S2"], piv["P"]
+            stop = piv["S3"] - (cur_atr or (piv["S2"] - piv["S3"]) * 0.4) * 0.8
+        else:  # у S2
+            entry = (near_s2[0], near_s2[1])
+            t1 = min(piv["P"] + 0.25*(piv["R1"]-piv["P"]), piv["R1"])
+            t2 = piv["R1"] if hz != "long" else piv["R2"]
+            stop = piv["S2"] - (cur_atr or (piv["S1"] - piv["S2"]) * 0.5) * 0.8
+
+        comment = "Цена у опорного дна. Берём восстановление с контролируемым риском."
+        alt = None
+        return Decision(
             stance="BUY",
-            entry=(round(zone_lo,2), round(zone_hi,2)),
-            target1=round(tgt1,2),
-            target2=round(tgt2,2),
+            entry=(round(entry[0],2), round(entry[1],2)),
+            target1=round(t1,2),
+            target2=round(t2,2),
             stop=round(stop,2),
-            alt="WAIT — если импульс вниз слишком силён",
-            comment="Перепроданность у дна; берём отскок к опорам.",
+            alt=alt,
+            comment=comment,
             meta=meta
         )
 
-    # Середина диапазона — преимущество не на нашей стороне
-    # Для MID/LONG предпочтение — дождаться отката к опоре
-    # Для SHORT — ждать подтверждения разворота
-    # Зона интереса = около P/S1 (для покупок) или R1 (для шортов) — в зависимости от расположения цены
+    # База — WAIT (разный текст и альтернатива)
     if price > piv["P"]:
-        # Ждать отката к P…R1 (для аккуратного шорта) – но по умолчанию WAIT
-        zone_lo = min(piv["R1"], piv["P"] + 0.2*rng)
-        zone_hi = max(piv["R1"], piv["P"] + 0.35*rng)
-        alt = f"SHORT от {round(zone_lo,2)}…{round(zone_hi,2)} при ослаблении"
+        zone_lo = min(piv["R1"], piv["P"] + 0.20*(piv["R2"]-piv["P"]))
+        zone_hi = max(piv["R1"], piv["P"] + 0.35*(piv["R2"]-piv["P"]))
+        alt = f"SHORT при ослаблении от {round(zone_lo,2)}…{round(zone_hi,2)}"
     else:
-        # Ждать отката к S1…P (для аккуратного лонга)
-        zone_lo = min(piv["S1"], piv["P"] - 0.35*rng)
-        zone_hi = max(piv["S1"], piv["P"] - 0.2*rng)
-        alt = f"BUY от {round(zone_lo,2)}…{round(zone_hi,2)} при стабилизации"
+        zone_lo = min(piv["S1"], piv["P"] - 0.35*(piv["P"]-piv["S2"]))
+        zone_hi = max(piv["S1"], piv["P"] - 0.20*(piv["P"]-piv["S2"]))
+        alt = f"BUY после стабилизации от {round(zone_lo,2)}…{round(zone_hi,2)}"
 
-    return Output(
+    return Decision(
         stance="WAIT",
-        entry=None,
-        target1=None,
-        target2=None,
-        stop=None,
+        entry=None, target1=None, target2=None, stop=None,
         alt=alt,
-        comment="Сейчас выгоднее подождать: преимущество не на нашей стороне.",
+        comment=_human_comment_wait(hz),
         meta=meta
     )
 
-# --------------------------- Публичная функция ---------------------------
 
-def analyze_ticker(ticker: str, horizon: Literal["short","mid","long"]) -> Dict[str,Any]:
-    """
-    Главная точка входа.
-    Возвращает ПЛОСКИЙ dict: stance, entry, target1, target2, stop, alt, comment, meta
-    """
-    # свечей хватит с запасом, чтобы построить годовые пивоты и индикаторы
-    lookback = {"short": 180, "mid": 420, "long": 900}[horizon]
-    data = fetch_daily(ticker, lookback_days=lookback)
-    out = compose_decision(ticker, horizon, data)
-    return out.to_dict()
+# ============================
+# Публичный интерфейс стратегии
+# ============================
 
+def analyze_ticker(ticker: str, horizon: Horizon = "mid") -> Decision:
+    """
+    Главная функция: тянем днёвки, считаем прошлый периодные пивоты, серии и выдаём решение.
+    horizon: "short" (1–5д) | "mid" (1–4н) | "long" (1–6м)
+    """
+    if horizon not in ("short","mid","long"):
+        raise ValueError("horizon must be: short|mid|long")
+
+    # запас по истории, чтобы точно покрыть прошлый год
+    bars = _poly_last_n_days(ticker, 500)
+    if not bars:
+        raise PolygonError("Нет данных по тикеру")
+
+    return _build_decision(bars, horizon)
+
+
+# Быстрый self-test (локально):  python -m core_strategy
+if __name__ == "__main__":
+    hz_list: List[Horizon] = ["short","mid","long"]
+    tk = os.getenv("TEST_TICKER", "QQQ")
+    for hz in hz_list:
+        d = analyze_ticker(tk, hz)
+        print(hz.upper(), d.stance, d.entry, d.target1, d.target2, d.stop)
+        print(json.dumps(d.meta, ensure_ascii=False))
