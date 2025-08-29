@@ -1,25 +1,24 @@
-# memo.py
-from core_strategy import Decision
+import streamlit as st
+from polygon_client import latest_price
+from core_strategy import analyze_ticker
+from narrator import humanize
 
-def build_invest_memo(ticker: str, dec: Decision) -> str:
-    """
-    Render a clean fund-style memo: action, entry, targets, stop — without exposing internals.
-    """
-    lines = []
-    lines.append(f"# {ticker.upper()} — Инвест-идея\n")
-    stance = {"BUY":"Покупка","SELL":"Продажа","WAIT":"Наблюдать"}[dec.stance]
-    hru = {"short":"Трейд (1–5 дней)","mid":"Среднесрок (1–4 недели)","long":"Долгосрок (1–6 месяцев)"}[dec.horizon]
-    lines.append(f"**Горизонт:** {hru}  \n**Базовый сценарий:** {stance}\n")
-    lines.append(f"**Текущая цена:** {dec.price:.2f}\n")
-    if dec.entry:
-        lines.append(f"**Зона входа:** {dec.entry[0]:.2f} — {dec.entry[1]:.2f}\n")
-    if dec.target1:
-        lines.append(f"**Цель 1:** {dec.target1:.2f}\n")
-    if dec.target2:
-        lines.append(f"**Цель 2:** {dec.target2:.2f}\n")
-    if dec.stop:
-        lines.append(f"**Стоп/защита:** {dec.stop:.2f}\n")
-    if dec.notes:
-        lines.append(f"\n_Комментарий:_ {dec.notes}\n")
-    lines.append("\n_Внутренние расчёты и уровни скрыты намеренно._\n")
-    return "".join(lines)
+st.set_page_config(page_title="CapinteL-Q — Investment Memo", page_icon="📝", layout="centered")
+st.markdown("### CapinteL-Q — Investment Memo (без раскрытия стратегии)")
+st.caption("Источник данных: Polygon.io • В тексте — только действия (вход/цели/стоп/альтернатива). Внутренние правила и расчёты скрыты.")
+
+ticker = st.text_input("Тикер", "QQQ")
+h_map = {"Трейд (1–5 дней)":"short", "Среднесрок (1–4 недели)":"mid", "Долгосрок (1–6 месяцев)":"long"}
+horizon = h_map[st.selectbox("Горизонт", list(h_map.keys()), index=1)]
+
+if st.button("Сформировать инвест-мемо"):
+    try:
+        price, df = latest_price(ticker)
+        dec = analyze_ticker(df, ticker, horizon)
+        st.markdown(f"#### 🎯 Asset: {ticker.upper()}")
+        st.caption(f"Горизонт: {st.session_state.get('horizon_label', '—')}  |  Текущая цена: ${price:,.2f}")
+        st.markdown("### 🧠 Core Recommendation")
+        st.write(humanize(dec))
+        st.info("Текст намеренно «человеческий» и не раскрывает внутреннюю математику/уровни.")
+    except Exception as e:
+        st.error(f"Ошибка формирования мемо: {e}")
