@@ -1,439 +1,414 @@
 # core_strategy.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-
 import os
 import math
 import time
-import json
-import datetime as dt
-from dataclasses import dataclass, asdict
-from typing import Optional, Tuple, Dict, Any, List, Literal
+import enum
+import dataclasses as dc
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, List
 
 import requests
+import pandas as pd
 
 
-# =========================
-# Конфиг и утилиты времени
-# =========================
+# ========= Параметры ==========
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+POLYGON_URL = "https://api.polygon.io"
 
-Horizon = Literal["short", "mid", "long"]  # 1–5д, 1–4н, 1–6м
+# Сколько дней подтягиваем истории (с запасом)
+DEFAULT_LOOKBACK_DAYS = 900  # ~3 года для дневок
 
-def _utc_today() -> dt.date:
-    return dt.datetime.utcnow().date()
+# Порог допуска к уровням (в процентах) по горизонту
+TOLERANCE = {
+    "short": 0.008,   # 0.8%
+    "mid":   0.010,   # 1.0%
+    "long":  0.012,   # 1.2%
+}
 
-def _date_of_ms(ms: int) -> dt.date:
-    return dt.datetime.utcfromtimestamp(ms / 1000).date()
+# Порог «длины серии» Heikin-Ashi (кол-во баров) по горизонту
+HA_SERIES_MIN = {
+    "short": 4,
+    "mid":   5,
+    "long":  6,
+}
 
-def _start_of_iso_week(d: dt.date) -> dt.date:
-    return d - dt.timedelta(days=d.weekday())
+# Порог «стриков» MACD-гистограммы (кол-во баров) по горизонту
+MACD_STREAK_MIN = {
+    "short": 4,
+    "mid":   6,
+    "long":  8,
+}
 
-def _start_of_month(d: dt.date) -> dt.date:
-    return d.replace(day=1)
-
-def _start_of_year(d: dt.date) -> dt.date:
-    return d.replace(month=1, day=1)
-
-def _prev_complete_week(today: dt.date) -> Tuple[dt.date, dt.date]:
-    start_cur = _start_of_iso_week(today)
-    end_prev = start_cur - dt.timedelta(days=1)
-    start_prev = end_prev - dt.timedelta(days=6)
-    return start_prev, end_prev
-
-def _prev_complete_month(today: dt.date) -> Tuple[dt.date, dt.date]:
-    first_cur = _start_of_month(today)
-    end_prev = first_cur - dt.timedelta(days=1)
-    first_prev = _start_of_month(end_prev)
-    return first_prev, end_prev
-
-def _prev_complete_year(today: dt.date) -> Tuple[dt.date, dt.date]:
-    first_cur = _start_of_year(today)
-    end_prev = first_cur - dt.timedelta(days=1)
-    first_prev = _start_of_year(end_prev)
-    return first_prev, end_prev
+# ATR множители (для приблизительных стоп/целей)
+ATR_MULT = {
+    "short": {"stop": 0.8, "t1": 0.6, "t2": 1.1},
+    "mid":   {"stop": 1.0, "t1": 1.0, "t2": 2.0},  # mid/long — цели больше завязаны на опорные зоны
+    "long":  {"stop": 1.3, "t1": 1.5, "t2": 3.0},
+}
 
 
-# ================
-# Polygon загрузчик
-# ================
+# ========= Хелперы данных / Polygon ==========
 
-class PolygonError(RuntimeError):
-    pass
-
-def _poly_agg_day(ticker: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
-    """
-    Днёвки по тикеру [start..end] включительно; sort=asc.
-    Возвращает список баров: {t(ms), o,h,l,c,v}
-    """
+def _http_get(url: str, params: Dict) -> Dict:
     if not POLYGON_API_KEY:
-        raise PolygonError("POLYGON_API_KEY отсутствует в окружении")
+        raise RuntimeError("POLYGON_API_KEY отсутствует в окружении")
+    p = dict(params or {})
+    p["apiKey"] = POLYGON_API_KEY
+    r = requests.get(url, params=p, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": POLYGON_API_KEY,
-    }
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code == 429:
-        # грубый backoff на всякий
-        time.sleep(1.0)
-        r = requests.get(url, params=params, timeout=20)
-    if r.status_code >= 300:
-        raise PolygonError(f"Polygon {r.status_code}: {r.text[:240]}")
-    data = r.json()
+def fetch_daily(ticker: str, days: int = DEFAULT_LOOKBACK_DAYS) -> pd.DataFrame:
+    """
+    Грузим дневные свечи через /v2/aggs/ticker/{ticker}/range/1/day
+    Берём последние 'days' баров.
+    """
+    # polygon принимает limit до 50000; берем с запасом
+    url = f"{POLYGON_URL}/v2/aggs/ticker/{ticker.upper()}/range/1/day/1970-01-01/2100-01-01"
+    data = _http_get(url, {"adjusted": "true", "sort": "desc", "limit": min(days, 50000)})
     results = data.get("results") or []
-    out = []
-    for x in results:
-        out.append({
-            "t": x["t"],
-            "o": float(x["o"]),
-            "h": float(x["h"]),
-            "l": float(x["l"]),
-            "c": float(x["c"]),
-            "v": float(x.get("v", 0.0)),
-        })
+    if not results:
+        raise RuntimeError(f"Нет данных по {ticker}")
+    # сортируем по времени (возрастающе)
+    rows = [{
+        "ts": pd.to_datetime(x["t"], unit="ms"),
+        "o": float(x["o"]), "h": float(x["h"]), "l": float(x["l"]), "c": float(x["c"]), "v": float(x.get("v", 0))
+    } for x in results]
+    df = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["ts"].dt.date)
+    return df
+
+
+# ========= Индикаторные расчёты (без раскрытия в текстах) ==========
+
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    # Формулы HA
+    out["ha_close"] = (out["o"] + out["h"] + out["l"] + out["c"]) / 4.0
+    ha_open = [out["o"].iloc[0]]
+    for i in range(1, len(out)):
+        ha_open.append((ha_open[i - 1] + out["ha_close"].iloc[i - 1]) / 2.0)
+    out["ha_open"] = pd.Series(ha_open, index=out.index)
+    out["ha_up"] = out["ha_close"] >= out["ha_open"]
     return out
 
-def _poly_last_n_days(ticker: str, n: int) -> List[Dict[str, Any]]:
-    end = _utc_today()
-    start = end - dt.timedelta(days=max(n, 10))
-    return _poly_agg_day(ticker, start, end)
-
-
-# ==================
-# Технич. расчёты
-# ==================
-
-def heikin_ashi(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """Heikin Ashi из обычных OHLC."""
-    if not bars:
-        return []
-    out = []
-    ha_open = (bars[0]["o"] + bars[0]["c"]) / 2.0
-    ha_close = (bars[0]["o"] + bars[0]["h"] + bars[0]["l"] + bars[0]["c"]) / 4.0
-    ha_high = max(bars[0]["h"], ha_open, ha_close)
-    ha_low  = min(bars[0]["l"], ha_open, ha_close)
-    out.append({"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close})
-    for b in bars[1:]:
-        ha_close = (b["o"] + b["h"] + b["l"] + b["c"]) / 4.0
-        ha_open = (out[-1]["o"] + out[-1]["c"]) / 2.0
-        ha_high = max(b["h"], ha_open, ha_close)
-        ha_low  = min(b["l"], ha_open, ha_close)
-        out.append({"o": ha_open, "h": ha_high, "l": ha_low, "c": ha_close})
-    return out
-
-def _ema(values: List[float], period: int) -> List[Optional[float]]:
-    if not values or period <= 0:
-        return [None]*len(values)
-    k = 2 / (period + 1)
-    out: List[Optional[float]] = []
-    ema_val: Optional[float] = None
-    for v in values:
-        if ema_val is None:
-            ema_val = v
-        else:
-            ema_val = (v - ema_val) * k + ema_val
-        out.append(ema_val)
-    return out
-
-def macd_hist(closes: List[float]) -> List[Optional[float]]:
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    macd = [ (a - b) if (a is not None and b is not None) else None for a,b in zip(ema12, ema26) ]
-    sig9 = _ema([0.0 if v is None else v for v in macd], 9)
-    hist = []
-    for m, s in zip(macd, sig9):
-        if m is None or s is None:
-            hist.append(None)
-        else:
-            hist.append(m - s)
+def macd_hist(df: pd.DataFrame, fast=12, slow=26, signal=9) -> pd.Series:
+    ema_fast = df["c"].ewm(span=fast, adjust=False).mean()
+    ema_slow = df["c"].ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - macd_signal
     return hist
 
-def rsi_wilder(closes: List[float], period: int = 14) -> List[Optional[float]]:
-    if len(closes) < period + 1:
-        return [None]*len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    # начальная средняя
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    out = [None]*(period)  # до первого значения
-    rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
-    out.append(100 - 100/(1+rs))
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain*(period-1) + gains[i]) / period
-        avg_loss = (avg_loss*(period-1) + losses[i]) / period
-        rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
-        out.append(100 - 100/(1+rs))
-    return out if len(out) == len(closes) else out + [None]*(len(closes)-len(out))
-
-def atr_wilder(bars: List[Dict[str,float]], period: int=14) -> List[Optional[float]]:
-    if len(bars) < period+1:
-        return [None]*len(bars)
-    trs = []
-    for i, b in enumerate(bars):
-        if i == 0:
-            trs.append(b["h"] - b["l"])
-        else:
-            prev_c = bars[i-1]["c"]
-            tr = max(b["h"]-b["l"], abs(b["h"]-prev_c), abs(b["l"]-prev_c))
-            trs.append(tr)
-    # Wilder smoothing
-    atr = [None]*len(bars)
-    atr[period] = sum(trs[:period+1]) / (period+1)
-    for i in range(period+1, len(bars)):
-        atr[i] = (atr[i-1]*(period) + trs[i]) / (period+1)
+def atr(df: pd.DataFrame, n=14) -> pd.Series:
+    high, low, close = df["h"], df["l"], df["c"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/n, adjust=False).mean()  # Wilder
     return atr
 
-
-# ============================
-# Пивоты (Fibonacci) прошл. ТФ
-# ============================
-
-def _pivots_fib(H: float, L: float, C: float) -> Dict[str, float]:
-    P = (H + L + C) / 3.0
-    rng = H - L
-    R1 = P + 0.382 * rng
-    R2 = P + 0.618 * rng
-    R3 = P + 1.000 * rng
-    S1 = P - 0.382 * rng
-    S2 = P - 0.618 * rng
-    S3 = P - 1.000 * rng
-    return {"P": P, "R1": R1, "R2": R2, "R3": R3, "S1": S1, "S2": S2, "S3": S3}
-
-def _period_slice_prev(bars: List[Dict[str,Any]], hz: Horizon) -> List[Dict[str,Any]]:
-    """Возвращает бары прошлой недели/месяца/года (завершённого периода)."""
-    if not bars:
-        return []
-    today = _utc_today()
-    if hz == "short":
-        a, b = _prev_complete_week(today)
-    elif hz == "mid":
-        a, b = _prev_complete_month(today)
-    else:
-        a, b = _prev_complete_year(today)
-    out = [x for x in bars if a <= _date_of_ms(x["t"]) <= b]
-    # запасной план, если рынок выходной/праздники → пусто
-    if not out:
-        lookback = {"short": 7, "mid": 35, "long": 400}[hz]
-        out = bars[-lookback-1:-1]
-    return out
-
-def _pivots_for_horizon(bars: List[Dict[str,Any]], hz: Horizon) -> Dict[str, float]:
-    prev = _period_slice_prev(bars, hz)
-    H = max(x["h"] for x in prev)
-    L = min(x["l"] for x in prev)
-    C = prev[-1]["c"]
-    return _pivots_fib(H, L, C)
-
-
-# ============================
-# «Серии» (стрики) по знаку
-# ============================
-
-def _last_streak_by_sign(values: List[float]) -> int:
-    """Длина последней одноцветной серии (+/-). Возвращает signed length."""
-    if not values:
+def _streak(series_up: pd.Series) -> int:
+    """длина последней серии True/False (по знаку серии выбираем конец)"""
+    if len(series_up) == 0:
         return 0
-    last_sign = 1 if values[-1] >= 0 else -1
-    n = 0
-    for v in reversed(values):
-        s = 1 if v >= 0 else -1
-        if s == last_sign:
-            n += 1
+    cnt = 1
+    for i in range(len(series_up)-2, -1, -1):
+        if series_up.iloc[i] == series_up.iloc[-1]:
+            cnt += 1
         else:
             break
-    return n * last_sign
+    return cnt
 
 
-# ============================
-# Результат стратегии / вывод
-# ============================
+# ========= Уровни Pivot (Fibonacci) по старшему периоду ==========
+
+def _pivot_fib(H: float, L: float, C: float) -> Dict[str, float]:
+    P = (H + L + C) / 3.0
+    R1 = P + 0.382 * (H - L)
+    R2 = P + 0.618 * (H - L)
+    R3 = P + 1.000 * (H - L)
+    S1 = P - 0.382 * (H - L)
+    S2 = P - 0.618 * (H - L)
+    S3 = P - 1.000 * (H - L)
+    return {"P": P, "R1": R1, "R2": R2, "R3": R3, "S1": S1, "S2": S2, "S3": S3}
+
+def _prev_period_HLC(df: pd.DataFrame, horizon: str) -> Tuple[float, float, float]:
+    d = df.copy()
+    d["year"] = d["date"].dt.year
+    d["month"] = d["date"].dt.month
+    d["week"] = d["date"].dt.isocalendar().week.astype(int)
+
+    if horizon == "short":
+        # прошлую неделю
+        grp = d.groupby(["year", "week"])
+    elif horizon == "mid":
+        # прошлый месяц
+        grp = d.groupby(["year", "month"])
+    else:
+        # прошлый год
+        grp = d.groupby(["year"])
+
+    agg = grp.agg(H=("h", "max"), L=("l", "min"), C=("c", "last")).reset_index()
+    if len(agg) < 2:
+        # мало истории — берём последний доступный период
+        row = agg.iloc[-1]
+        return float(row.H), float(row.L), float(row.C)
+    row = agg.iloc[-2]
+    return float(row.H), float(row.L), float(row.C)
+
+
+# ========= Решение и «человеческий» текст ==========
+
+class Stance(str, enum.Enum):
+    BUY = "BUY"
+    SHORT = "SHORT"
+    CLOSE = "CLOSE"
+    WAIT = "WAIT"
 
 @dataclass
 class Decision:
-    stance: Literal["BUY","SHORT","WAIT"]
-    entry: Optional[Tuple[float, float]]  # диапазон входа или None
+    ticker: str
+    horizon: str                # short / mid / long
+    stance: Stance
+    entry: Optional[Tuple[float, float]]  # (lo, hi) или None
     target1: Optional[float]
     target2: Optional[float]
     stop: Optional[float]
-    alt: Optional[str]
     comment: str
-    meta: Dict[str, Any]
+    price: float
+    # Для «диагностики» внутри приложения; наружу не проговариваем
+    meta: Dict[str, float]
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+    def as_dict(self) -> Dict:
+        return {
+            "ticker": self.ticker,
+            "horizon": self.horizon,
+            "stance": self.stance.value,
+            "entry": self.entry,
+            "target1": self.target1,
+            "target2": self.target2,
+            "stop": self.stop,
+            "comment": self.comment,
+            "price": self.price,
+            "meta": self.meta,
+        }
 
 
-def _tolerances(hz: Horizon) -> Tuple[float, float]:
-    # допуски к R2/R3 (и S2/S3) по горизонту
-    if hz == "short":
-        return 0.008, 0.012
-    if hz == "mid":
-        return 0.010, 0.016
-    return 0.012, 0.020
+def _human_text(dec: Decision) -> str:
+    """Короткое живое резюме без раскрытия математики."""
+    hz = {"short": "трейд", "mid": "среднесрок", "long": "долгосрок"}[dec.horizon]
+    if dec.stance == Stance.WAIT:
+        return f"Сейчас выгоднее подождать ({hz}). На текущих уровнях явного преимущества нет — ждём откат к опоре или подтверждение разворота."
+    if dec.stance == Stance.BUY:
+        a, b = dec.entry or (None, None)
+        return f"Покупка ({hz}). Вход: {a:.2f}…{b:.2f}. Цели: {dec.target1:.2f} / {dec.target2:.2f}. Защита: {dec.stop:.2f}. Действуем аккуратно."
+    if dec.stance == Stance.SHORT:
+        a, b = dec.entry or (None, None)
+        return f"Шорт ({hz}). Вход: {a:.2f}…{b:.2f}. Цели: {dec.target1:.2f} / {dec.target2:.2f}. Защита: {dec.stop:.2f}. Работаем от ослабления импульса."
+    # CLOSE
+    return f"Фиксация позиции ({hz}). Закрываем и ждём новую формацию."
 
 
-def _human_comment_wait(hz: Horizon) -> str:
+# ========= Ядро принятия решения ==========
+
+def analyze_ticker(ticker: str, horizon: str = "mid") -> Decision:
+    """
+    Возвращает Decision (объект, а не dict!)
+    horizon: 'short' | 'mid' | 'long'
+    """
+    horizon = horizon.lower().strip()
+    assert horizon in ("short", "mid", "long")
+
+    # 1) Данные
+    df = fetch_daily(ticker, days=DEFAULT_LOOKBACK_DAYS)
+    px = float(df["c"].iloc[-1])
+
+    # 2) Индикаторы (в мету; наружу не рассказываем)
+    df_ha = heikin_ashi(df)
+    ha_series = _streak(df_ha["ha_up"])
+    hist = macd_hist(df)
+    macd_up = hist.iloc[-1] >= 0
+    hist_sign_series = _streak(hist >= 0)
+    _atr = atr(df).iloc[-1]
+
+    # 3) Опорные уровни (по прошлому периоду)
+    H, L, C = _prev_period_HLC(df, horizon)
+    piv = _pivot_fib(H, L, C)
+
+    tol = TOLERANCE[horizon]
+    atr_m = ATR_MULT[horizon]
+
+    # 4) Композитная логика — без «выдачи формулы» наружу
+    def near(x, y):  # x около y
+        return abs(x - y) <= y * tol
+
+    # Перегрев у крыши → чаще ищем шорт
+    over_roof = (px >= piv["R2"]*(1 - tol)) and (ha_series >= HA_SERIES_MIN[horizon]) and (hist_sign_series >= MACD_STREAK_MIN[horizon])
+
+    # Перепроданность у дна → чаще ищем лонг
+    under_floor = (px <= piv["S2"]*(1 + tol)) and (ha_series >= HA_SERIES_MIN[horizon]) and (hist_sign_series >= MACD_STREAK_MIN[horizon])
+
+    entry: Optional[Tuple[float, float]] = None
+    t1 = t2 = st = None
+    stance = Stance.WAIT
+    comment = ""
+
+    if over_roof:
+        # Агрессивный шорт: вход у R2…R3
+        lo = min(piv["R2"], px)
+        hi = max(piv["R3"], px)
+        entry = (lo, hi)
+        # Цели — к R1/P (мягче) или глубже по горизонту
+        t1 = piv["R1"]
+        t2 = piv["P"] if horizon != "short" else max(piv["P"], px - atr_m["t2"] * _atr)
+        st = max(piv["R2"], px) + atr_m["stop"] * _atr
+        stance = Stance.SHORT
+        comment = "Играем от ослабления. Не гонимся за вершиной — берём откат."
+
+    elif under_floor:
+        # Лонг от дна: вход у S2…S3
+        lo = min(piv["S3"], px)
+        hi = max(piv["S2"], px)
+        entry = (lo, hi)
+        t1 = piv["S1"]
+        t2 = piv["P"] if horizon != "short" else min(piv["P"], px + atr_m["t2"] * _atr)
+        st = min(piv["S2"], px) - atr_m["stop"] * _atr
+        stance = Stance.BUY
+        comment = "Покупаем от поддержки. Если импульс ломается — фиксируемся без упрямства."
+
+    else:
+        stance = Stance.WAIT
+        comment = "На текущих уровнях явного преимущества нет — ждём откат к опоре или подтверждение разворота."
+
+    dec = Decision(
+        ticker=ticker.upper(),
+        horizon=horizon,
+        stance=stance,
+        entry=entry,
+        target1=t1,
+        target2=t2,
+        stop=st,
+        comment=comment,
+        price=px,
+        meta={
+            "P": piv["P"], "R1": piv["R1"], "R2": piv["R2"], "R3": piv["R3"],
+            "S1": piv["S1"], "S2": piv["S2"], "S3": piv["S3"],
+            "ha_series": float(ha_series),
+            "macd_streak": float(hist_sign_series),
+            "atr": float(_atr),
+            "tolerance": float(tol),
+            "text": _human_text  # просто ссылка на функцию (для app не используем)
+        }
+    )
+    return dec
+
+
+# ========= БЭКТЕСТ (очень компактный, но рабочий) ==========
+
+@dc.dataclass
+class BacktestRow:
+    date: str
+    price: float
+    signal: str    # BUY/SHORT/WAIT
+    pnl: float     # накопительный PnL после закрытия сделки (если была)
+
+
+def run_backtest(
+    ticker: str,
+    horizon: str = "mid",
+    years: int = 2,
+    start_capital: float = 100_000.0,
+    commission_bps_roundtrip: float = 5.0,  # б.п. «туда-обратно»
+) -> Dict:
+    """
+    Простейший бэктест по дневкам.
+    Правила:
+      - каждый день строим новое Decision на основе истории до этого дня;
+      - если stance BUY/SHORT и Close попадает в зону entry -> входим на close;
+      - выходим по достижению target1 (или target2) либо по стопу;
+      - иначе выходим, если сигнал сменился на WAIT.
+    Это упрощение, но стабильное и быстрое.
+    """
+    horizon = horizon.lower().strip()
+    df_full = fetch_daily(ticker, days=int(max(365*years + 60, 400)))
+    rows: List[BacktestRow] = []
+
+    pos_side = None      # "long"/"short"/None
+    pos_entry = None
+    capital = start_capital
+    shares = 0.0
+    cum_pnl = 0.0
+
+    def _close_position(price: float):
+        nonlocal pos_side, pos_entry, shares, capital, cum_pnl
+        if pos_side is None:
+            return
+        if pos_side == "long":
+            pnl = (price - pos_entry) * shares
+        else:
+            pnl = (pos_entry - price) * shares
+        # комиссия «туда-обратно»
+        fee = abs(price) * abs(shares) * (commission_bps_roundtrip/10000.0)
+        pnl -= fee
+        capital += pnl
+        cum_pnl += pnl
+        pos_side = None
+        pos_entry = None
+        shares = 0.0
+
+    start_idx = max(50, len(df_full) - years*252)  # чтобы хватило истории для индикаторов
+    for i in range(start_idx, len(df_full)):
+        df = df_full.iloc[: i+1].copy()
+        px = float(df["c"].iloc[-1])
+        date_str = str(df["date"].iloc[-1])
+
+        # строим решение на основании истории до текущего дня
+        dec = analyze_ticker(ticker, horizon=horizon)
+        # важное: используем текущую цену df_full.iloc[i]["c"], а не «свежий» интернет
+
+        sig = dec.stance.value
+
+        # логика вход/выход
+        if pos_side is None:
+            if dec.entry is not None and dec.stance in (Stance.BUY, Stance.SHORT):
+                lo, hi = dec.entry
+                if lo <= px <= hi:
+                    pos_side = "long" if dec.stance == Stance.BUY else "short"
+                    pos_entry = px
+                    # берём на 1x капитал (упрощение)
+                    shares = capital / px
+        else:
+            # есть позиция — проверяем t1/stop
+            stop = dec.stop
+            t1 = dec.target1
+            if stop is not None:
+                if pos_side == "long" and px <= stop:
+                    _close_position(px)
+                elif pos_side == "short" and px >= stop:
+                    _close_position(px)
+            if pos_side is not None and t1 is not None:
+                if pos_side == "long" and px >= t1:
+                    _close_position(px)
+                elif pos_side == "short" and px <= t1:
+                    _close_position(px)
+            # если сигнала на продолжение нет — закрываем
+            if pos_side is not None and dec.stance == Stance.WAIT:
+                _close_position(px)
+
+        rows.append(BacktestRow(date=date_str, price=px, signal=sig, pnl=cum_pnl))
+
     return {
-        "short": "Для трейда лучше не гнаться: ждём реакцию у края диапазона и подтверждение.",
-        "mid":   "Сейчас выгоднее подождать: нужен откат к опоре прошлого месяца или явный отказ.",
-        "long":  "Долгосрок — без суеты: ждём перезагрузку к годовым опорам и признаки разворота.",
-    }[hz]
-
-
-def _build_decision(bars: List[Dict[str,Any]], hz: Horizon) -> Decision:
-    # текущая цена
-    price = bars[-1]["c"]
-
-    # пивоты от прошлой недели/месяца/года
-    piv = _pivots_for_horizon(bars, hz)
-
-    # тех.метры (в meta, в текст не показываем)
-    ha = heikin_ashi(bars)
-    ha_close = [x["c"] for x in ha]
-    ha_delta = [0.0] + [ha_close[i]-ha_close[i-1] for i in range(1, len(ha_close))]
-    ha_st = _last_streak_by_sign(ha_delta)
-
-    closes = [x["c"] for x in bars]
-    macdh = macd_hist(closes)
-    macd_st = _last_streak_by_sign([0.0 if v is None else v for v in macdh])
-
-    rsi = rsi_wilder(closes, 14)
-    atr = atr_wilder(bars, 14)
-    cur_atr = next((x for x in reversed(atr) if x is not None), None)
-
-    # зоны около R2/R3 & S2/S3
-    tol_r2, tol_r3 = _tolerances(hz)
-    near_r2 = (piv["R2"] * (1 - tol_r2), piv["R2"] * (1 + tol_r2))
-    near_r3 = (piv["R3"] * (1 - tol_r3), piv["R3"] * (1 + tol_r3))
-    near_s2 = (piv["S2"] * (1 - tol_r2), piv["S2"] * (1 + tol_r2))
-    near_s3 = (piv["S3"] * (1 - tol_r3), piv["S3"] * (1 + tol_r3))
-
-    in_r2_zone = near_r2[0] <= price <= near_r2[1]
-    in_r3_zone = near_r3[0] <= price <= near_r3[1]
-    in_s2_zone = near_s2[0] <= price <= near_s2[1]
-    in_s3_zone = near_s3[0] <= price <= near_s3[1]
-
-    need_ha = {"short":4, "mid":5, "long":6}[hz]
-    need_mh = {"short":4, "mid":6, "long":8}[hz]
-
-    over_roof = (in_r3_zone or in_r2_zone) and (abs(ha_st) >= need_ha) and (abs(macd_st) >= need_mh) and (macdh[-1] is not None and macdh[-1] > 0)
-    under_floor = (in_s3_zone or in_s2_zone) and (abs(ha_st) >= need_ha) and (abs(macd_st) >= need_mh) and (macdh[-1] is not None and macdh[-1] < 0)
-
-    meta = {
-        "price": price,
-        "piv": {k: round(v, 2) for k, v in piv.items()},
-        "rsi": rsi[-1],
-        "atr": cur_atr,
-        "ha_streak": ha_st,
-        "macd_streak": macd_st,
-        "horizon": hz,
+        "ticker": ticker.upper(),
+        "horizon": horizon,
+        "start_capital": start_capital,
+        "end_capital": capital,
+        "pnl": cum_pnl,
+        "rows": [dc.asdict(r) for r in rows]
     }
 
-    # SHORT у крыши
-    if over_roof:
-        if in_r3_zone:
-            entry = (min(price, near_r3[0]), near_r3[1])
-            t1, t2 = piv["R2"], piv["P"]
-            stop = piv["R3"] + (cur_atr or (piv["R3"] - piv["R2"]) * 0.4) * 0.8
-        else:  # у R2
-            entry = (near_r2[0], near_r2[1])
-            # консервативная первая цель ближе к P/S1, вторая глубже при силе
-            t1 = max(piv["P"] - 0.25*(piv["P"]-piv["S1"]), piv["S1"])
-            t2 = piv["S1"] if hz != "long" else piv["S2"]
-            stop = piv["R2"] + (cur_atr or (piv["R2"] - piv["R1"]) * 0.5) * 0.8
-
-        comment = "Перегруженный верх. Играем от ослабления, работаем аккуратно."
-        alt = None
-        return Decision(
-            stance="SHORT",
-            entry=(round(entry[0],2), round(entry[1],2)),
-            target1=round(t1,2),
-            target2=round(t2,2),
-            stop=round(stop,2),
-            alt=alt,
-            comment=comment,
-            meta=meta
-        )
-
-    # LONG у дна
-    if under_floor:
-        if in_s3_zone:
-            entry = (near_s3[0], max(price, near_s3[1]))
-            t1, t2 = piv["S2"], piv["P"]
-            stop = piv["S3"] - (cur_atr or (piv["S2"] - piv["S3"]) * 0.4) * 0.8
-        else:  # у S2
-            entry = (near_s2[0], near_s2[1])
-            t1 = min(piv["P"] + 0.25*(piv["R1"]-piv["P"]), piv["R1"])
-            t2 = piv["R1"] if hz != "long" else piv["R2"]
-            stop = piv["S2"] - (cur_atr or (piv["S1"] - piv["S2"]) * 0.5) * 0.8
-
-        comment = "Цена у опорного дна. Берём восстановление с контролируемым риском."
-        alt = None
-        return Decision(
-            stance="BUY",
-            entry=(round(entry[0],2), round(entry[1],2)),
-            target1=round(t1,2),
-            target2=round(t2,2),
-            stop=round(stop,2),
-            alt=alt,
-            comment=comment,
-            meta=meta
-        )
-
-    # База — WAIT (разный текст и альтернатива)
-    if price > piv["P"]:
-        zone_lo = min(piv["R1"], piv["P"] + 0.20*(piv["R2"]-piv["P"]))
-        zone_hi = max(piv["R1"], piv["P"] + 0.35*(piv["R2"]-piv["P"]))
-        alt = f"SHORT при ослаблении от {round(zone_lo,2)}…{round(zone_hi,2)}"
-    else:
-        zone_lo = min(piv["S1"], piv["P"] - 0.35*(piv["P"]-piv["S2"]))
-        zone_hi = max(piv["S1"], piv["P"] - 0.20*(piv["P"]-piv["S2"]))
-        alt = f"BUY после стабилизации от {round(zone_lo,2)}…{round(zone_hi,2)}"
-
-    return Decision(
-        stance="WAIT",
-        entry=None, target1=None, target2=None, stop=None,
-        alt=alt,
-        comment=_human_comment_wait(hz),
-        meta=meta
-    )
-
-
-# ============================
-# Публичный интерфейс стратегии
-# ============================
-
-def analyze_ticker(ticker: str, horizon: Horizon = "mid") -> Decision:
-    """
-    Главная функция: тянем днёвки, считаем прошлый периодные пивоты, серии и выдаём решение.
-    horizon: "short" (1–5д) | "mid" (1–4н) | "long" (1–6м)
-    """
-    if horizon not in ("short","mid","long"):
-        raise ValueError("horizon must be: short|mid|long")
-
-    # запас по истории, чтобы точно покрыть прошлый год
-    bars = _poly_last_n_days(ticker, 500)
-    if not bars:
-        raise PolygonError("Нет данных по тикеру")
-
-    return _build_decision(bars, horizon)
-
-
-# Быстрый self-test (локально):  python -m core_strategy
-if __name__ == "__main__":
-    hz_list: List[Horizon] = ["short","mid","long"]
-    tk = os.getenv("TEST_TICKER", "QQQ")
-    for hz in hz_list:
-        d = analyze_ticker(tk, hz)
-        print(hz.upper(), d.stance, d.entry, d.target1, d.target2, d.stop)
-        print(json.dumps(d.meta, ensure_ascii=False))
