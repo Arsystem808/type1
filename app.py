@@ -96,19 +96,23 @@ if run:
     else:
         try:
             res = analyze_ticker(ticker, horizon=horizon)  # <-- ВОЗВРАЩАЕТ Decision
-            # Ожидаемые поля:
-            #   res.ticker : str
-            #   res.price  : float
-            #   res.stance : Enum или str (но мы не используем .get)
-            #   res.entry  : tuple[low, high] | None
-            #   res.target1, res.target2, res.stop : float | None
-            #   res.comment : str (человеческий текст)
-            #   res.meta    : dict (диагностика)
-            render_decision(res)
+            # внутри app.py после analyze_ticker(...)
+d = analyze_ticker(ticker, horizon_key)
 
-        except Exception as e:
-            st.error(f"Ошибка: {e}")
-            with st.expander("Стек ошибки"):
+st.subheader(f"{d.ticker} — текущая цена: ${d.price:,.2f}")
+st.markdown("### 🧠 Результат:")
+st.write(f"**Сценарий:** {d.stance} · **Уверенность:** {d.confidence}%")
+st.write(d.comment)
+
+if d.entry:
+    st.write(f"🎯 **Вход:** {d.entry[0]:.2f} … {d.entry[1]:.2f}")
+if d.target1: st.write(f"🎯 **Цель 1:** {d.target1:.2f}")
+if d.target2: st.write(f"🎯 **Цель 2:** {d.target2:.2f}")
+if d.stop:    st.write(f"🛡️ **Стоп/защита:** {d.stop:.2f}")
+
+with st.expander("🔧 Диагностика (внутренняя)"):
+    st.json(d.meta)
+
                 st.code("".join(traceback.format_exc()))
 
 # -----------------------------
